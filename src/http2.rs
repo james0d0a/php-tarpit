@@ -27,6 +27,9 @@ const MAX_CONCURRENT_STREAMS: u32 = 100;
 
 /// Connection-specific headers that are illegal in HTTP/2 (RFC 9113 §8.2.2).
 const HOP_BY_HOP: [&str; 5] = ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"];
+/// Headers Apache's mod_http2 appends after the response's own, in this order
+/// (observed on Apache 2.4.68, Debian bookworm).
+const TRAILING: [&str; 2] = ["date", "server"];
 
 /// Serves one HTTP/2 connection. Requests are logged by `capture` once
 /// their response stream has ended on the wire.
@@ -109,10 +112,20 @@ async fn handle_stream(
 
     let response = shared.persona.route(&meta.target);
     let mut builder = http::Response::builder().status(response.status);
+    // mod_http2 adds Date and Server itself, after the response's own headers.
+    let mut trailing = Vec::with_capacity(2);
     for (name, value) in response.headers() {
         if HOP_BY_HOP.iter().any(|h| name.eq_ignore_ascii_case(h)) {
             continue;
         }
+        if TRAILING.iter().any(|h| name.eq_ignore_ascii_case(h)) {
+            trailing.push((name, value));
+            continue;
+        }
+        builder = builder.header(name, value.as_ref());
+    }
+    trailing.sort_by_key(|(name, _)| TRAILING.iter().position(|h| name.eq_ignore_ascii_case(h)));
+    for (name, value) in trailing {
         builder = builder.header(name, value.as_ref());
     }
     let head = builder.body(()).expect("persona headers are validated at load");

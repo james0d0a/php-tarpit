@@ -212,10 +212,11 @@ async fn identical_bodies_are_stored_once_across_connections() {
     }
 
     let reqs = lines(&data.join("requests.jsonl"), 3).await;
+    // Body files land when each connection's capture finishes.
+    lines(&data.join("connections.jsonl"), 3).await;
     let file = reqs[0]["body"]["file"].clone();
     assert!(reqs.iter().all(|r| r["body"]["file"] == file && r["body"]["stored"] == payload.len()));
     assert_eq!(body_file(&data, &reqs[0]["body"]), payload);
-    lines(&data.join("connections.jsonl"), 3).await;
     // One request body + one persona response body; no temp leftovers.
     let stored: Vec<_> = std::fs::read_dir(data.join("bodies")).unwrap().flatten().filter(|e| e.path().is_file()).collect();
     assert_eq!(stored.len(), 2);
@@ -327,7 +328,7 @@ async fn http2_over_tls_lengthless_body_is_logged_and_key_log_matches_client_sec
         roots.add(cert.unwrap()).unwrap();
     }
     let keys = Arc::new(ClientKeys::default());
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut client = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .unwrap()
@@ -353,6 +354,9 @@ async fn http2_over_tls_lengthless_body_is_logged_and_key_log_matches_client_sec
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers()["x-powered-by"], "PHP/8.3.30");
     assert!(resp.headers().get("connection").is_none());
+    // Apache's mod_http2 order: the response's own headers, then date, server.
+    let names: Vec<&str> = resp.headers().keys().map(|k| k.as_str()).collect();
+    assert_eq!(names, ["x-powered-by", "content-length", "content-type", "date", "server"]);
     let mut body = resp.into_body();
     let mut got = Vec::new();
     while let Some(chunk) = body.data().await {
