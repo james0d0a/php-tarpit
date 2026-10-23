@@ -78,6 +78,8 @@ pub struct Response {
     pub reason: &'static str,
     headers: Vec<(String, HeaderValue)>,
     pub body: Bytes,
+    /// sha256 of `body`, for the body store.
+    pub body_sha256: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -148,11 +150,13 @@ impl Response {
             };
             headers.push((name, value));
         }
+        let body = Bytes::from(vars.apply(&file.body));
         Ok(Self {
             status: file.status,
             reason: status.canonical_reason().unwrap_or(""),
             headers,
-            body: Bytes::from(vars.apply(&file.body)),
+            body_sha256: <sha2::Sha256 as sha2::Digest>::digest(&body).into(),
+            body,
         })
     }
 

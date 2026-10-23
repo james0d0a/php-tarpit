@@ -1,7 +1,10 @@
 //! HTTP/2 front (TLS + ALPN only; no h2c). Request bodies are read to the
 //! end of the stream whether or not a content-length was sent.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use h2::{RecvStream, server::SendResponse};
@@ -11,7 +14,10 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-use crate::server::{ConnInfo, RequestMeta, Shared};
+use crate::{
+    h2capture::{H2Capture, H2Tee},
+    server::{RequestMeta, Shared},
+};
 
 const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -22,13 +28,15 @@ const MAX_CONCURRENT_STREAMS: u32 = 100;
 /// Connection-specific headers that are illegal in HTTP/2 (RFC 9113 §8.2.2).
 const HOP_BY_HOP: [&str; 5] = ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"];
 
-pub async fn serve<S>(io: S, shared: Arc<Shared>, conn: ConnInfo) -> u32
+/// Serves one HTTP/2 connection. Requests are logged by `capture` once
+/// their response stream has ended on the wire.
+pub async fn serve<S>(io: S, shared: Arc<Shared>, capture: Arc<Mutex<H2Capture>>) -> u32
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let handshake = h2::server::Builder::new()
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
-        .handshake::<_, Bytes>(io);
+        .handshake::<_, Bytes>(H2Tee::new(io, capture.clone()));
     let Ok(Ok(mut h2)) = timeout(FIRST_REQUEST_TIMEOUT, handshake).await else {
         return 0;
     };
@@ -41,7 +49,7 @@ where
             next = h2.accept() => match next {
                 Some(Ok((req, respond))) => {
                     requests += 1;
-                    streams.spawn(handle_stream(req, respond, shared.clone(), conn));
+                    streams.spawn(handle_stream(req, respond, shared.clone(), capture.clone()));
                 }
                 Some(Err(_)) | None => break,
             },
@@ -63,12 +71,14 @@ async fn handle_stream(
     req: http::Request<RecvStream>,
     mut respond: SendResponse<Bytes>,
     shared: Arc<Shared>,
-    conn: ConnInfo,
+    capture: Arc<Mutex<H2Capture>>,
 ) {
+    let stream_id = respond.stream_id().as_u32();
+    let submit = |meta| capture.lock().expect("capture lock poisoned").submit(stream_id, meta);
     let (parts, mut body) = req.into_parts();
     let mut meta = RequestMeta {
         protocol: "HTTP/2",
-        stream_id: Some(respond.stream_id().as_u32()),
+        stream_id: Some(stream_id),
         method: parts.method.to_string(),
         target: parts.uri.path_and_query().map(|p| p.as_str().to_owned()).unwrap_or_default(),
         authority: parts.uri.authority().map(ToString::to_string),
@@ -93,7 +103,7 @@ async fn handle_stream(
     .await;
     meta.body_size = received;
     if !matches!(read, Ok(Ok(()))) {
-        shared.log_request(&conn, meta);
+        submit(meta);
         return;
     }
 
@@ -114,5 +124,5 @@ async fn handle_stream(
         }
         meta.status = Some(response.status);
     }
-    shared.log_request(&conn, meta);
+    submit(meta);
 }

@@ -3,8 +3,7 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::NonZeroUsize,
-    path::PathBuf,
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -18,18 +17,19 @@ use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
 use crate::{
-    capture::StreamCapture,
+    capture::{ConnCapture, MessageCapture},
     config::Settings,
+    h2capture::H2Capture,
     http1, http2,
     log::{ConnectionRecord, JsonlWriter, RequestRecord, now},
     persona::{Persona, PersonaFile, Vars},
     session::AttackSessions,
+    storage::Storage,
     tls,
 };
 
 pub const REQUESTS_LOG: &str = "requests.jsonl";
 pub const CONNECTIONS_LOG: &str = "connections.jsonl";
-pub const STREAMS_DIR: &str = "streams";
 pub const TLS_DIR: &str = "tls";
 
 const ATTACK_SESSION_IDLE: Duration = Duration::from_secs(5 * 60);
@@ -41,7 +41,8 @@ pub struct Shared {
     requests: JsonlWriter,
     connections: JsonlWriter,
     sessions: AttackSessions,
-    streams_dir: PathBuf,
+    storage: Arc<Storage>,
+    max_connection_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -66,7 +67,7 @@ pub struct RequestMeta {
 }
 
 impl Shared {
-    pub fn log_request(&self, conn: &ConnInfo, meta: RequestMeta) {
+    pub fn log_request(&self, conn: &ConnInfo, meta: RequestMeta, capture: MessageCapture) {
         self.requests.write(&RequestRecord {
             ts: now(),
             conn_id: conn.conn_id,
@@ -83,6 +84,10 @@ impl Shared {
             headers: meta.headers,
             body_size: meta.body_size,
             status: meta.status,
+            c2s_range: capture.c2s_range,
+            s2c_range: capture.s2c_range,
+            body: capture.body,
+            response_body: capture.response_body,
         });
     }
 }
@@ -96,11 +101,9 @@ pub struct Sensor {
 impl Sensor {
     /// Starts a sensor presenting `persona` with resolved `settings`.
     pub async fn start(settings: Settings, persona: PersonaFile) -> Result<Self> {
-        let streams_dir = settings.data_dir.join(STREAMS_DIR);
         let tls_dir = settings.data_dir.join(TLS_DIR);
-        for dir in [&streams_dir, &tls_dir] {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        }
+        std::fs::create_dir_all(&tls_dir).with_context(|| format!("creating {}", tls_dir.display()))?;
+        let storage = Storage::open(&settings.data_dir, settings.max_total_bytes)?;
         let (tls_config, hostname) = tls::server_config(&tls_dir, settings.hostname.as_deref())?;
         let acceptor = TlsAcceptor::from(Arc::new(tls_config));
         let persona = Persona::build(
@@ -118,7 +121,8 @@ impl Sensor {
             requests: JsonlWriter::open(&settings.data_dir.join(REQUESTS_LOG)).await?,
             connections: JsonlWriter::open(&settings.data_dir.join(CONNECTIONS_LOG)).await?,
             sessions: AttackSessions::new(ATTACK_SESSION_IDLE, ATTACK_SESSION_CAPACITY),
-            streams_dir,
+            storage: storage.clone(),
+            max_connection_bytes: settings.max_connection_bytes,
         });
 
         let http = bind(settings.bind, settings.http_port).await?;
@@ -143,6 +147,7 @@ impl Sensor {
             tasks: vec![
                 tokio::spawn(accept_loop(http, shared.clone(), None)),
                 tokio::spawn(accept_loop(https, shared, Some(acceptor))),
+                tokio::spawn(storage.rotation_task()),
             ],
         })
     }
@@ -198,44 +203,46 @@ async fn handle_connection(tcp: TcpStream, peer: SocketAddr, shared: Arc<Shared>
         tls: tls.is_some(),
     };
     let attack_session_id = shared.sessions.touch(conn.src_ip);
-    let capture = match StreamCapture::create(&shared.streams_dir, conn.conn_id).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, "cannot create stream files; dropping connection");
-            return;
-        }
-    };
+    let mut capture =
+        match ConnCapture::create(shared.storage.clone(), conn.conn_id, shared.max_connection_bytes).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "cannot create stream files; dropping connection");
+                return;
+            }
+        };
 
     let (mut sni, mut alpn, mut tls_error) = (None, None, None);
-    let requests = match tls {
-        None => http1::serve(capture.tee(tcp), &shared, &conn).await,
+    let (requests, stats) = match tls {
+        None => (http1::serve(tcp, &shared, &conn, &mut capture).await, capture.finish().await),
         Some(acceptor) => match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
             Ok(Ok(stream)) => {
                 let session = stream.get_ref().1;
                 sni = session.server_name().map(str::to_owned);
                 alpn = session.alpn_protocol().map(|p| String::from_utf8_lossy(p).into_owned());
                 if alpn.as_deref() == Some("h2") {
-                    http2::serve(capture.tee(stream), shared.clone(), conn).await
+                    let h2 = Arc::new(Mutex::new(H2Capture::new(capture, shared.clone(), conn)));
+                    let requests = http2::serve(stream, shared.clone(), h2.clone()).await;
+                    // serve() joins every stream task and drops the tee.
+                    let Some(h2) = Arc::into_inner(h2) else {
+                        tracing::error!(conn_id = %conn.conn_id, "HTTP/2 capture still shared after close");
+                        return;
+                    };
+                    (requests, h2.into_inner().expect("capture lock poisoned").finish().await)
                 } else {
-                    http1::serve(capture.tee(stream), &shared, &conn).await
+                    (http1::serve(stream, &shared, &conn, &mut capture).await, capture.finish().await)
                 }
             }
             Ok(Err(e)) => {
                 tls_error = Some(e.to_string());
-                0
+                (0, capture.finish().await)
             }
             Err(_) => {
                 tls_error = Some("handshake timeout".to_owned());
-                0
+                (0, capture.finish().await)
             }
         },
     };
-
-    let bytes_c2s = capture.counters().c2s.load(Ordering::Relaxed);
-    let bytes_s2c = capture.counters().s2c.load(Ordering::Relaxed);
-    if let Err(e) = capture.finish().await {
-        tracing::error!(conn_id = %conn.conn_id, error = %e, "stream capture write failed");
-    }
     shared.connections.write(&ConnectionRecord {
         ts_open,
         ts_close: now(),
@@ -248,8 +255,9 @@ async fn handle_connection(tcp: TcpStream, peer: SocketAddr, shared: Arc<Shared>
         sni,
         alpn,
         tls_error,
-        bytes_c2s,
-        bytes_s2c,
+        bytes_c2s: stats.wire_c2s,
+        bytes_s2c: stats.wire_s2c,
+        capture_truncated: stats.truncated,
         requests,
     });
 }

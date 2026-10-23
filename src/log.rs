@@ -12,6 +12,8 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::capture::BodyRef;
+
 #[derive(Clone)]
 pub struct JsonlWriter {
     tx: mpsc::UnboundedSender<Vec<u8>>,
@@ -75,6 +77,16 @@ pub struct RequestRecord {
     pub body_size: u64,
     /// Response status sent; null when the request was cut off before a response.
     pub status: Option<u16>,
+    /// `[start, end)` byte offsets in `streams/<conn_id>.c2s` / `.s2c`. For
+    /// HTTP/2, the span of this stream's frames, which may interleave with
+    /// other streams. Body payloads are not in the stream files (see `body`).
+    pub c2s_range: Option<[u64; 2]>,
+    pub s2c_range: Option<[u64; 2]>,
+    /// Request body in `bodies/`; absent when empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<BodyRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_body: Option<BodyRef>,
 }
 
 #[derive(Serialize)]
@@ -93,8 +105,11 @@ pub struct ConnectionRecord {
     pub alpn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_error: Option<String>,
-    /// Plaintext bytes in `<conn_id>.c2s` / `<conn_id>.s2c`.
+    /// Plaintext bytes that crossed the wire in each direction.
     pub bytes_c2s: u64,
     pub bytes_s2c: u64,
+    /// True when the per-connection capture cap was reached and later bytes
+    /// were not stored.
+    pub capture_truncated: bool,
     pub requests: u32,
 }

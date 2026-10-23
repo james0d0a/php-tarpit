@@ -92,7 +92,7 @@ async fn lines(path: &Path, n: usize) -> Vec<Value> {
 }
 
 #[tokio::test]
-async fn http1_chunked_request_is_answered_logged_and_captured_byte_for_byte() {
+async fn http1_chunked_request_is_answered_logged_and_captured_losslessly() {
     let dir = tempfile::tempdir().unwrap();
     let sensor = start(dir.path()).await;
     let data = dir.path().join("data");
@@ -127,10 +127,166 @@ async fn http1_chunked_request_is_answered_logged_and_captured_byte_for_byte() {
     assert_eq!(req["attack_session_id"], conns[0]["attack_session_id"]);
     assert_eq!(req["conn_id"], conns[0]["conn_id"]);
 
+    // Stream files hold everything but body payloads; bodies are stored apart.
+    let c2s = stream(&data, req, "c2s");
+    let s2c = stream(&data, req, "s2c");
+    let elided: &[u8] = b"POST /?p=1 HTTP/1.1\r\nHost: sensor.test\r\nX-Mixed-CASE: a\r\n\
+        Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+        5\r\n\r\n3;ext=1\r\n\r\n0\r\nX-Trailer: t\r\n\r\n";
+    assert_eq!(c2s, elided);
+    assert_eq!(body_file(&data, &req["body"]), b"helloabc");
+    assert_eq!(req["body"]["sha256"], req["body"]["file"]);
+    assert_eq!(req["c2s_range"], serde_json::json!([0, elided.len()]));
+    assert_eq!(s2c, head.as_bytes().iter().chain(b"\r\n\r\n").copied().collect::<Vec<_>>());
+    assert_eq!(req["s2c_range"], serde_json::json!([0, s2c.len()]));
+    assert_eq!(body_file(&data, &req["response_body"]), b"<html>wp</html>");
+    // Lossless: stored stream bytes + body bytes = what crossed the wire.
+    assert_eq!(conns[0]["bytes_c2s"], request.len());
+    assert_eq!(c2s.len() + 8, request.len());
+}
+
+fn stream(data: &Path, req: &Value, dir: &str) -> Vec<u8> {
     let id = req["conn_id"].as_str().unwrap();
-    let streams = data.join("streams");
-    assert_eq!(std::fs::read(streams.join(format!("{id}.c2s"))).unwrap(), request);
-    assert_eq!(std::fs::read(streams.join(format!("{id}.s2c"))).unwrap(), response);
+    std::fs::read(data.join(format!("streams/{id}.{dir}"))).unwrap()
+}
+
+fn body_file(data: &Path, body: &Value) -> Vec<u8> {
+    std::fs::read(data.join("bodies").join(body["file"].as_str().unwrap())).unwrap()
+}
+
+/// Writes `raw` on a fresh connection and reads until the sensor closes.
+async fn exchange(sensor: &Sensor, raw: &[u8]) -> Vec<u8> {
+    let mut tcp = TcpStream::connect(sensor.http_addr).await.unwrap();
+    tcp.write_all(raw).await.unwrap();
+    let mut response = Vec::new();
+    tcp.read_to_end(&mut response).await.unwrap();
+    response
+}
+
+#[tokio::test]
+async fn keep_alive_requests_get_contiguous_offsets_into_the_stream_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let sensor = start(dir.path()).await;
+    let data = dir.path().join("data");
+
+    let first: &[u8] = b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nbody";
+    let second: &[u8] = b"\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    let response = exchange(&sensor, &[first, second].concat()).await;
+
+    let reqs = lines(&data.join("requests.jsonl"), 2).await;
+    lines(&data.join("connections.jsonl"), 1).await;
+    let c2s = stream(&data, &reqs[0], "c2s");
+    let s2c = stream(&data, &reqs[0], "s2c");
+    let slice = |buf: &[u8], r: &Value| buf[r[0].as_u64().unwrap() as usize..r[1].as_u64().unwrap() as usize].to_vec();
+    // Body payload "body" is elided from the first request's range.
+    assert_eq!(slice(&c2s, &reqs[0]["c2s_range"]), b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n");
+    // The leading empty line belongs to the second request.
+    assert_eq!(slice(&c2s, &reqs[1]["c2s_range"]), second);
+    assert_eq!(reqs[0]["c2s_range"][1], reqs[1]["c2s_range"][0]);
+    assert_eq!(reqs[1]["c2s_range"][1], c2s.len());
+
+    // Response ranges + response bodies rebuild exactly what the client got.
+    let mut rebuilt = Vec::new();
+    for r in &reqs {
+        rebuilt.extend(slice(&s2c, &r["s2c_range"]));
+        rebuilt.extend(body_file(&data, &r["response_body"]));
+    }
+    assert_eq!(rebuilt, response);
+    assert_eq!(reqs[0]["status"], 404);
+    assert_eq!(reqs[1]["status"], 200);
+}
+
+#[tokio::test]
+async fn identical_bodies_are_stored_once_across_connections() {
+    let dir = tempfile::tempdir().unwrap();
+    let sensor = start(dir.path()).await;
+    let data = dir.path().join("data");
+
+    // Larger than the in-memory threshold, so the temp-file path is used.
+    let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let mut request = format!("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", payload.len())
+        .into_bytes();
+    request.extend_from_slice(&payload);
+    for _ in 0..3 {
+        exchange(&sensor, &request).await;
+    }
+
+    let reqs = lines(&data.join("requests.jsonl"), 3).await;
+    let file = reqs[0]["body"]["file"].clone();
+    assert!(reqs.iter().all(|r| r["body"]["file"] == file && r["body"]["stored"] == payload.len()));
+    assert_eq!(body_file(&data, &reqs[0]["body"]), payload);
+    lines(&data.join("connections.jsonl"), 3).await;
+    // One request body + one persona response body; no temp leftovers.
+    let stored: Vec<_> = std::fs::read_dir(data.join("bodies")).unwrap().flatten().filter(|e| e.path().is_file()).collect();
+    assert_eq!(stored.len(), 2);
+    assert_eq!(std::fs::read_dir(data.join("bodies/tmp")).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn connection_cap_keeps_a_prefix_and_the_request_is_still_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = Overrides { max_connection_bytes: Some("1000".parse().unwrap()), ..Default::default() };
+    let sensor = start_with(dir.path(), cli, Overrides::default()).await;
+    let data = dir.path().join("data");
+
+    let head = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\nConnection: close\r\n\r\n";
+    let payload = vec![b'z'; 5000];
+    let response = exchange(&sensor, &[&head[..], &payload].concat()).await;
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+
+    let req = &lines(&data.join("requests.jsonl"), 1).await[0];
+    let conn = &lines(&data.join("connections.jsonl"), 1).await[0];
+    let kept = 1000 - head.len();
+    assert_eq!(req["body_size"], 5000);
+    assert_eq!(req["body"]["size"], 5000);
+    assert_eq!(req["body"]["stored"], kept);
+    assert_ne!(req["body"]["sha256"], req["body"]["file"]);
+    assert_eq!(body_file(&data, &req["body"]), vec![b'z'; kept]);
+    assert_eq!(conn["capture_truncated"], true);
+    assert_eq!(conn["bytes_c2s"], head.len() + 5000);
+    assert_eq!(stream(&data, req, "c2s"), head);
+    assert!(stream(&data, req, "s2c").is_empty());
+}
+
+#[tokio::test]
+async fn total_cap_rotates_out_the_oldest_connections() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = Overrides { max_total_bytes: Some("64KiB".parse().unwrap()), ..Default::default() };
+    let sensor = start_with(dir.path(), cli, Overrides::default()).await;
+    let data = dir.path().join("data");
+
+    for i in 0..6u8 {
+        let mut request = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 20000\r\nConnection: close\r\n\r\n".to_vec();
+        request.extend(std::iter::repeat_n(i, 20_000));
+        exchange(&sensor, &request).await;
+        // Distinct mtimes so "oldest" is well defined.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let reqs = lines(&data.join("requests.jsonl"), 6).await;
+    lines(&data.join("connections.jsonl"), 6).await;
+
+    let exists = |r: &Value| data.join("bodies").join(r["body"]["file"].as_str().unwrap()).exists();
+    for _ in 0..200 {
+        if !exists(&reqs[0]) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let id = |r: &Value| r["conn_id"].as_str().unwrap().to_owned();
+    assert!(!exists(&reqs[0]), "oldest body survived rotation");
+    assert!(!data.join(format!("streams/{}.c2s", id(&reqs[0]))).exists());
+    assert!(exists(&reqs[5]), "newest body was rotated");
+    assert!(data.join(format!("streams/{}.c2s", id(&reqs[5]))).exists());
+    let used: u64 = walk_size(&data);
+    assert!(used <= 64 * 1024, "data dir is {used} bytes");
+}
+
+fn walk_size(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| if e.path().is_dir() { walk_size(&e.path()) } else { e.metadata().unwrap().len() })
+        .sum()
 }
 
 #[tokio::test]
@@ -214,6 +370,22 @@ async fn http2_over_tls_lengthless_body_is_logged_and_key_log_matches_client_sec
     let conn = &lines(&data.join("connections.jsonl"), 1).await[0];
     assert_eq!(conn["alpn"], "h2");
     assert_eq!(conn["sni"], "sensor.test");
+
+    // DATA payloads are stored as one body; frames stay in the stream file.
+    let mut expected = vec![b'x'; 70_000];
+    expected.extend_from_slice(b"tail");
+    assert_eq!(body_file(&data, &req["body"]), expected);
+    assert_eq!(body_file(&data, &req["response_body"]), b"<html>wp</html>");
+    let c2s = stream(&data, req, "c2s");
+    let s2c = stream(&data, req, "s2c");
+    assert!(c2s.starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"));
+    assert!(!c2s.windows(64).any(|w| w.iter().all(|&b| b == b'x')), "body bytes leaked into stream");
+    assert_eq!(c2s.len() as u64 + 70_004, conn["bytes_c2s"].as_u64().unwrap());
+    assert_eq!(s2c.len() as u64 + 15, conn["bytes_s2c"].as_u64().unwrap());
+    let [cs, ce] = [req["c2s_range"][0].as_u64().unwrap(), req["c2s_range"][1].as_u64().unwrap()];
+    let [ss, se] = [req["s2c_range"][0].as_u64().unwrap(), req["s2c_range"][1].as_u64().unwrap()];
+    assert!(cs > 24 && cs < ce && ce <= c2s.len() as u64, "{cs}..{ce}");
+    assert!(ss < se && se <= s2c.len() as u64, "{ss}..{se}");
 
     let server_log = std::fs::read_to_string(data.join("tls/keylog.txt")).unwrap();
     let client_lines = keys.0.lock().unwrap().clone();

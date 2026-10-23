@@ -2,12 +2,14 @@
 
 pub mod capture;
 pub mod config;
+mod h2capture;
 mod http1;
 mod http2;
 pub mod log;
 pub mod persona;
 pub mod server;
 mod session;
+pub mod storage;
 pub mod tls;
 
 pub use config::{Overrides, Settings};

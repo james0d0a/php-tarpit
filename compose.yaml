@@ -17,7 +17,8 @@ services:
       # PHP_TARPIT_MAX_TOTAL_BYTES: 5GiB
       RUST_LOG: info
     volumes:
-      # requests.jsonl, connections.jsonl, streams/, tls/ (cert, key, keylog.txt)
+      # requests.jsonl, connections.jsonl, streams/ (framing), bodies/ (deduplicated
+      # payloads by sha256), tls/ (cert, key, hostname, keylog.txt)
       - sensor-data:/data
 
 volumes:
