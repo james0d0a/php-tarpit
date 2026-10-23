@@ -1,0 +1,3 @@
+[alias]
+# Black-box tests against the sensor container (needs docker or a compatible CLI).
+harness = "test --manifest-path harness/Cargo.toml"

@@ -1,4 +1,5 @@
 /target
+/harness/target
 # Captured data, TLS keys and key logs never go in the repo.
 /data
 *.pcap
