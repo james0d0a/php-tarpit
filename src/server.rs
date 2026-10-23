@@ -19,9 +19,10 @@ use uuid::Uuid;
 
 use crate::{
     capture::StreamCapture,
+    config::Settings,
     http1, http2,
     log::{ConnectionRecord, JsonlWriter, RequestRecord, now},
-    persona::Persona,
+    persona::{Persona, PersonaFile, Vars},
     session::AttackSessions,
     tls,
 };
@@ -34,16 +35,6 @@ pub const TLS_DIR: &str = "tls";
 const ATTACK_SESSION_IDLE: Duration = Duration::from_secs(5 * 60);
 const ATTACK_SESSION_CAPACITY: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
-
-#[derive(Debug, Clone)]
-pub struct Config {
-    pub persona: PathBuf,
-    pub data_dir: PathBuf,
-    pub bind: IpAddr,
-    /// 0 picks an ephemeral port.
-    pub http_port: u16,
-    pub https_port: u16,
-}
 
 pub struct Shared {
     pub persona: Persona,
@@ -103,29 +94,49 @@ pub struct Sensor {
 }
 
 impl Sensor {
-    pub async fn start(config: Config) -> Result<Self> {
-        let persona = Persona::load(&config.persona)?;
-        let streams_dir = config.data_dir.join(STREAMS_DIR);
-        let tls_dir = config.data_dir.join(TLS_DIR);
+    /// Starts a sensor presenting `persona` with resolved `settings`.
+    pub async fn start(settings: Settings, persona: PersonaFile) -> Result<Self> {
+        let streams_dir = settings.data_dir.join(STREAMS_DIR);
+        let tls_dir = settings.data_dir.join(TLS_DIR);
         for dir in [&streams_dir, &tls_dir] {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        let tls_config = tls::server_config(&tls_dir, persona.hostname.as_deref())?;
+        let (tls_config, hostname) = tls::server_config(&tls_dir, settings.hostname.as_deref())?;
         let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+        let persona = Persona::build(
+            persona,
+            &Vars {
+                hostname: &hostname,
+                apache_version: &settings.apache_version,
+                php_version: &settings.php_version,
+            },
+        )
+        .context("building persona")?;
 
         let shared = Arc::new(Shared {
             persona,
-            requests: JsonlWriter::open(&config.data_dir.join(REQUESTS_LOG)).await?,
-            connections: JsonlWriter::open(&config.data_dir.join(CONNECTIONS_LOG)).await?,
+            requests: JsonlWriter::open(&settings.data_dir.join(REQUESTS_LOG)).await?,
+            connections: JsonlWriter::open(&settings.data_dir.join(CONNECTIONS_LOG)).await?,
             sessions: AttackSessions::new(ATTACK_SESSION_IDLE, ATTACK_SESSION_CAPACITY),
             streams_dir,
         });
 
-        let http = bind(config.bind, config.http_port).await?;
-        let https = bind(config.bind, config.https_port).await?;
+        let http = bind(settings.bind, settings.http_port).await?;
+        let https = bind(settings.bind, settings.https_port).await?;
         let http_addr = http.local_addr()?;
         let https_addr = https.local_addr()?;
-        tracing::info!(persona = shared.persona.name, %http_addr, %https_addr, "sensor listening");
+        tracing::info!(
+            persona = shared.persona.name,
+            hostname,
+            apache_version = settings.apache_version,
+            php_version = settings.php_version,
+            data_dir = %settings.data_dir.display(),
+            max_connection_bytes = settings.max_connection_bytes,
+            max_total_bytes = settings.max_total_bytes,
+            %http_addr,
+            %https_addr,
+            "sensor listening"
+        );
         Ok(Self {
             http_addr,
             https_addr,

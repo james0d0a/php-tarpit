@@ -4,11 +4,17 @@ services:
     image: php_tarpit:latest
     restart: unless-stopped
     # Host networking records client source IPs and IPv6 exactly as they arrive.
-    network_mode: host
+    # Each setting resolves as CLI flag > PHP_TARPIT_* variable > persona
+    # [settings] > built-in default. Uncomment to override the persona.
     environment:
       # PHP_TARPIT_PERSONA: /etc/php_tarpit/personas/apache-modphp-wordpress.toml
       # PHP_TARPIT_HTTP_PORT: "80"
       # PHP_TARPIT_HTTPS_PORT: "443"
+      # PHP_TARPIT_HOSTNAME: web01            # default: kept from the existing cert, else random
+      # PHP_TARPIT_APACHE_VERSION: "2.4.62"
+      # PHP_TARPIT_PHP_VERSION: "8.3.30"
+      # PHP_TARPIT_MAX_CONNECTION_BYTES: 64MiB
+      # PHP_TARPIT_MAX_TOTAL_BYTES: 5GiB
       RUST_LOG: info
     volumes:
       # requests.jsonl, connections.jsonl, streams/, tls/ (cert, key, keylog.txt)

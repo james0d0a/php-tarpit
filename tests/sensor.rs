@@ -1,14 +1,13 @@
 //! In-process sensor on ephemeral ports: bytes on the wire and files on disk.
 
 use std::{
-    net::{IpAddr, Ipv4Addr},
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use bytes::Bytes;
-use php_tarpit::{Config, Sensor};
+use php_tarpit::{Overrides, PersonaFile, Sensor, Settings};
 use rustls::{ClientConfig, KeyLog, RootCertStore};
 use rustls_pki_types::{CertificateDer, ServerName, pem::PemObject};
 use serde_json::Value;
@@ -20,15 +19,21 @@ use tokio_rustls::TlsConnector;
 
 const PERSONA: &str = r#"
 name = "test"
-hostname = "sensor.test"
+
+[settings]
+bind = "127.0.0.1"
+http_port = 0
+https_port = 0
+apache_version = "2.4.62"
+php_version = "8.3.30"
 
 [[route]]
 path = "/"
 status = 200
 headers = [
   ["Date", "{date}"],
-  ["Server", "Apache/2.4.62 (Debian)"],
-  ["X-Powered-By", "PHP/8.3.30"],
+  ["Server", "Apache/{apache_version} (Debian)"],
+  ["X-Powered-By", "PHP/{php_version}"],
   ["Content-Length", "{content_length}"],
   ["Keep-Alive", "timeout=5, max=100"],
   ["Connection", "Keep-Alive"],
@@ -39,7 +44,7 @@ body = "<html>wp</html>"
 [not_found]
 status = 404
 headers = [["Date", "{date}"], ["Content-Length", "{content_length}"]]
-body = "nf"
+body = "<address>Apache/{apache_version} (Debian) Server at {hostname} Port 80</address> {unknown}"
 
 [bad_request]
 status = 400
@@ -47,18 +52,29 @@ headers = [["Content-Length", "{content_length}"], ["Connection", "close"]]
 body = "bad"
 "#;
 
+/// Starts the sensor with `cli` and `env` layered over the test persona; the
+/// data directory is always `dir/data`.
+async fn start_with(dir: &Path, mut cli: Overrides, env: Overrides) -> Sensor {
+    let persona_path = dir.join("persona.toml");
+    std::fs::write(&persona_path, PERSONA).unwrap();
+    let persona = PersonaFile::load(&persona_path).unwrap();
+    cli.data_dir = Some(dir.join("data"));
+    let settings = Settings::resolve(&cli, &env, &persona.settings).unwrap();
+    Sensor::start(settings, persona).await.unwrap()
+}
+
 async fn start(dir: &Path) -> Sensor {
-    let persona = dir.join("persona.toml");
-    std::fs::write(&persona, PERSONA).unwrap();
-    Sensor::start(Config {
-        persona,
-        data_dir: dir.join("data"),
-        bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        http_port: 0,
-        https_port: 0,
-    })
-    .await
-    .unwrap()
+    start_with(dir, Overrides::default(), Overrides::default()).await
+}
+
+/// Sends one HTTP/1.1 request with `Connection: close`; returns the raw response.
+async fn get(sensor: &Sensor, path: &str) -> String {
+    let mut tcp = TcpStream::connect(sensor.http_addr).await.unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    tcp.write_all(req.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    tcp.read_to_string(&mut response).await.unwrap();
+    response
 }
 
 /// Polls a JSONL file until it has `n` lines (writes are asynchronous).
@@ -146,7 +162,8 @@ impl KeyLog for ClientKeys {
 #[tokio::test]
 async fn http2_over_tls_lengthless_body_is_logged_and_key_log_matches_client_secrets() {
     let dir = tempfile::tempdir().unwrap();
-    let sensor = start(dir.path()).await;
+    let cli = Overrides { hostname: Some("sensor.test".into()), ..Default::default() };
+    let sensor = start_with(dir.path(), cli, Overrides::default()).await;
     let data = dir.path().join("data");
 
     let mut roots = RootCertStore::empty();
@@ -207,11 +224,46 @@ async fn http2_over_tls_lengthless_body_is_logged_and_key_log_matches_client_sec
 }
 
 #[tokio::test]
-async fn certificate_survives_restart() {
+async fn cli_and_env_override_persona_settings_on_the_wire() {
     let dir = tempfile::tempdir().unwrap();
-    let cert_path = dir.path().join("data/tls/cert.pem");
-    drop(start(dir.path()).await);
-    let first = std::fs::read(&cert_path).unwrap();
-    drop(start(dir.path()).await);
-    assert_eq!(std::fs::read(&cert_path).unwrap(), first);
+    let cli = Overrides { php_version: Some("8.3.7".into()), ..Default::default() };
+    let env = Overrides::from_env(|k| match k {
+        "PHP_TARPIT_APACHE_VERSION" => Some("2.4.99".into()),
+        // Lower precedence than the CLI flag: must lose.
+        "PHP_TARPIT_PHP_VERSION" => Some("8.3.1".into()),
+        _ => None,
+    })
+    .unwrap();
+    let sensor = start_with(dir.path(), cli, env).await;
+
+    let home = get(&sensor, "/").await;
+    assert!(home.contains("\r\nServer: Apache/2.4.99 (Debian)\r\n"), "{home}");
+    assert!(home.contains("\r\nX-Powered-By: PHP/8.3.7\r\n"), "{home}");
+    // Body substitution; unknown braces pass through untouched.
+    let not_found = get(&sensor, "/missing").await;
+    assert!(not_found.contains("<address>Apache/2.4.99 (Debian) Server at "), "{not_found}");
+    assert!(not_found.ends_with(" {unknown}"), "{not_found}");
+}
+
+#[tokio::test]
+async fn hostname_is_kept_across_restarts_and_regenerated_when_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let tls = dir.path().join("data/tls");
+
+    // No hostname configured: a random one is generated, then kept.
+    let sensor = start(dir.path()).await;
+    let cert = std::fs::read(tls.join("cert.pem")).unwrap();
+    let hostname = std::fs::read_to_string(tls.join("hostname")).unwrap().trim().to_owned();
+    assert!(get(&sensor, "/x").await.contains(&format!("Server at {hostname} Port")));
+    drop(sensor);
+    let sensor = start(dir.path()).await;
+    assert_eq!(std::fs::read(tls.join("cert.pem")).unwrap(), cert);
+    assert!(get(&sensor, "/x").await.contains(&format!("Server at {hostname} Port")));
+    drop(sensor);
+
+    // An explicit, different hostname replaces the certificate.
+    let cli = Overrides { hostname: Some("web01.example.com".into()), ..Default::default() };
+    let sensor = start_with(dir.path(), cli, Overrides::default()).await;
+    assert_ne!(std::fs::read(tls.join("cert.pem")).unwrap(), cert);
+    assert!(get(&sensor, "/x").await.contains("Server at web01.example.com Port"));
 }

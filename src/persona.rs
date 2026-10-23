@@ -3,6 +3,9 @@
 //! Every response lists its headers in the exact order and capitalisation the
 //! persona emits on HTTP/1.1. Two header values are filled in per response:
 //! `{date}` (IMF-fixdate) and `{content_length}` (body length in bytes).
+//! `{hostname}`, `{apache_version}` and `{php_version}` are replaced with the
+//! resolved settings in any header value or body when the persona is built;
+//! other braces are left alone.
 
 use std::{collections::HashMap, path::Path, time::SystemTime};
 
@@ -10,18 +13,38 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use serde::Deserialize;
 
+use crate::config::Overrides;
+
 const DATE_TOKEN: &str = "{date}";
 const CONTENT_LENGTH_TOKEN: &str = "{content_length}";
 
+/// A parsed persona file, before settings are substituted in.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PersonaFile {
+pub struct PersonaFile {
     name: String,
-    hostname: Option<String>,
+    /// The persona's settings layer, below CLI flags and environment variables.
+    #[serde(default)]
+    pub settings: Overrides,
     #[serde(default, rename = "route")]
     routes: Vec<RouteFile>,
     not_found: ResponseFile,
     bad_request: ResponseFile,
+}
+
+/// Values substituted into the persona's text.
+pub struct Vars<'a> {
+    pub hostname: &'a str,
+    pub apache_version: &'a str,
+    pub php_version: &'a str,
+}
+
+impl Vars<'_> {
+    fn apply(&self, text: &str) -> String {
+        text.replace("{hostname}", self.hostname)
+            .replace("{apache_version}", self.apache_version)
+            .replace("{php_version}", self.php_version)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,8 +67,6 @@ struct ResponseFile {
 #[derive(Debug)]
 pub struct Persona {
     pub name: String,
-    /// Hostname for the generated certificate; random when unset.
-    pub hostname: Option<String>,
     routes: HashMap<String, Response>,
     pub not_found: Response,
     pub bad_request: Response,
@@ -66,21 +87,26 @@ enum HeaderValue {
     ContentLength,
 }
 
-impl Persona {
+impl PersonaFile {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading persona file {}", path.display()))?;
+            .with_context(|| format!("cannot read persona file {}", path.display()))?;
         Self::parse(&text).with_context(|| format!("invalid persona file {}", path.display()))
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        let file: PersonaFile = toml::from_str(text)?;
+        Ok(toml::from_str(text)?)
+    }
+}
+
+impl Persona {
+    pub fn build(file: PersonaFile, vars: &Vars) -> Result<Self> {
         let mut routes = HashMap::with_capacity(file.routes.len());
         for route in file.routes {
             if !route.path.starts_with('/') {
                 bail!("route path {:?} must start with '/'", route.path);
             }
-            let response = Response::prepare(route.response)
+            let response = Response::prepare(route.response, vars)
                 .with_context(|| format!("route {:?}", route.path))?;
             if routes.insert(route.path.clone(), response).is_some() {
                 bail!("duplicate route path {:?}", route.path);
@@ -88,10 +114,9 @@ impl Persona {
         }
         Ok(Self {
             name: file.name,
-            hostname: file.hostname,
             routes,
-            not_found: Response::prepare(file.not_found).context("not_found")?,
-            bad_request: Response::prepare(file.bad_request).context("bad_request")?,
+            not_found: Response::prepare(file.not_found, vars).context("not_found")?,
+            bad_request: Response::prepare(file.bad_request, vars).context("bad_request")?,
         })
     }
 
@@ -104,7 +129,7 @@ impl Persona {
 }
 
 impl Response {
-    fn prepare(file: ResponseFile) -> Result<Self> {
+    fn prepare(file: ResponseFile, vars: &Vars) -> Result<Self> {
         let status = http::StatusCode::from_u16(file.status)
             .with_context(|| format!("invalid status {}", file.status))?;
         let mut headers = Vec::with_capacity(file.headers.len());
@@ -115,6 +140,7 @@ impl Response {
                 DATE_TOKEN => HeaderValue::Date,
                 CONTENT_LENGTH_TOKEN => HeaderValue::ContentLength,
                 _ => {
+                    let value = vars.apply(&value);
                     http::HeaderValue::from_str(&value)
                         .with_context(|| format!("invalid value for header {name:?}"))?;
                     HeaderValue::Literal(value)
@@ -126,7 +152,7 @@ impl Response {
             status: file.status,
             reason: status.canonical_reason().unwrap_or(""),
             headers,
-            body: Bytes::from(file.body),
+            body: Bytes::from(vars.apply(&file.body)),
         })
     }
 

@@ -5,13 +5,20 @@
 
 name = "apache-modphp-wordpress"
 
+# Lowest-precedence settings layer: CLI flags and PHP_TARPIT_* environment
+# variables override these. `{apache_version}`, `{php_version}` and
+# `{hostname}` below are filled in from the resolved settings.
+[settings]
+apache_version = "2.4.62"
+php_version = "8.3.30"
+
 [[route]]
 path = "/"
 status = 200
 headers = [
   ["Date", "{date}"],
-  ["Server", "Apache/2.4.62 (Debian)"],
-  ["X-Powered-By", "PHP/8.3.30"],
+  ["Server", "Apache/{apache_version} (Debian)"],
+  ["X-Powered-By", "PHP/{php_version}"],
   ["Vary", "Accept-Encoding"],
   ["Content-Length", "{content_length}"],
   ["Keep-Alive", "timeout=5, max=100"],
@@ -64,8 +71,8 @@ path = "/index.php"
 status = 301
 headers = [
   ["Date", "{date}"],
-  ["Server", "Apache/2.4.62 (Debian)"],
-  ["X-Powered-By", "PHP/8.3.30"],
+  ["Server", "Apache/{apache_version} (Debian)"],
+  ["X-Powered-By", "PHP/{php_version}"],
   ["X-Redirect-By", "WordPress"],
   ["Location", "/"],
   ["Content-Length", "{content_length}"],
@@ -80,8 +87,8 @@ path = "/wp-login.php"
 status = 200
 headers = [
   ["Date", "{date}"],
-  ["Server", "Apache/2.4.62 (Debian)"],
-  ["X-Powered-By", "PHP/8.3.30"],
+  ["Server", "Apache/{apache_version} (Debian)"],
+  ["X-Powered-By", "PHP/{php_version}"],
   ["Expires", "Wed, 11 Jan 1984 05:00:00 GMT"],
   ["Cache-Control", "no-cache, must-revalidate, max-age=0, no-store, private"],
   ["Set-Cookie", "wordpress_test_cookie=WP%20Cookie%20check; path=/"],
@@ -134,8 +141,8 @@ path = "/xmlrpc.php"
 status = 405
 headers = [
   ["Date", "{date}"],
-  ["Server", "Apache/2.4.62 (Debian)"],
-  ["X-Powered-By", "PHP/8.3.30"],
+  ["Server", "Apache/{apache_version} (Debian)"],
+  ["X-Powered-By", "PHP/{php_version}"],
   ["Allow", "POST"],
   ["Content-Length", "{content_length}"],
   ["Keep-Alive", "timeout=5, max=100"],
@@ -149,7 +156,7 @@ path = "/readme.html"
 status = 200
 headers = [
   ["Date", "{date}"],
-  ["Server", "Apache/2.4.62 (Debian)"],
+  ["Server", "Apache/{apache_version} (Debian)"],
   ["Last-Modified", "Tue, 30 Sep 2025 20:41:12 GMT"],
   ["ETag", "\"1d8b-641d3e0a6c600\""],
   ["Accept-Ranges", "bytes"],
@@ -202,8 +209,8 @@ path = "/robots.txt"
 status = 200
 headers = [
   ["Date", "{date}"],
-  ["Server", "Apache/2.4.62 (Debian)"],
-  ["X-Powered-By", "PHP/8.3.30"],
+  ["Server", "Apache/{apache_version} (Debian)"],
+  ["X-Powered-By", "PHP/{php_version}"],
   ["X-Robots-Tag", "noindex, follow"],
   ["Content-Length", "{content_length}"],
   ["Keep-Alive", "timeout=5, max=100"],
@@ -222,7 +229,7 @@ Sitemap: /wp-sitemap.xml
 status = 404
 headers = [
   ["Date", "{date}"],
-  ["Server", "Apache/2.4.62 (Debian)"],
+  ["Server", "Apache/{apache_version} (Debian)"],
   ["Content-Length", "{content_length}"],
   ["Keep-Alive", "timeout=5, max=100"],
   ["Connection", "Keep-Alive"],
@@ -236,7 +243,7 @@ body = """
 <h1>Not Found</h1>
 <p>The requested URL was not found on this server.</p>
 <hr>
-<address>Apache/2.4.62 (Debian) Server at localhost Port 80</address>
+<address>Apache/{apache_version} (Debian) Server at {hostname} Port 80</address>
 </body></html>
 """
 
@@ -244,7 +251,7 @@ body = """
 status = 400
 headers = [
   ["Date", "{date}"],
-  ["Server", "Apache/2.4.62 (Debian)"],
+  ["Server", "Apache/{apache_version} (Debian)"],
   ["Content-Length", "{content_length}"],
   ["Connection", "close"],
   ["Content-Type", "text/html; charset=iso-8859-1"],
@@ -258,6 +265,6 @@ body = """
 <p>Your browser sent a request that this server could not understand.<br />
 </p>
 <hr>
-<address>Apache/2.4.62 (Debian) Server at 127.0.1.1 Port 80</address>
+<address>Apache/{apache_version} (Debian) Server at {hostname} Port 80</address>
 </body></html>
 """
