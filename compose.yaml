@@ -1,9 +1,25 @@
+# Requires Docker Engine 24.0.6+ (moby#46221) running as root (not rootless):
+# the binary carries the file capability cap_net_bind_service=+ep, which the
+# kernel can only honour if the container is granted NET_BIND_SERVICE. Without
+# it (older engine, or cap_add removed) the container fails at start with
+# "exec ... Operation not permitted".
 services:
   sensor:
     build: .
     image: php_tarpit:latest
     restart: unless-stopped
     # Host networking records client source IPs and IPv6 exactly as they arrive.
+    network_mode: host
+    # Non-root (the image's `nonroot`, uid 65532), read-only root filesystem,
+    # no privilege escalation, and only the capability to bind ports < 1024.
+    user: "65532:65532"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
     # Each setting resolves as CLI flag > PHP_TARPIT_* variable > persona
     # [settings] > built-in default. Uncomment to override the persona.
     environment:
@@ -17,8 +33,9 @@ services:
       # PHP_TARPIT_MAX_TOTAL_BYTES: 5GiB
       RUST_LOG: info
     volumes:
-      # requests.jsonl, connections.jsonl, streams/ (framing), bodies/ (deduplicated
-      # payloads by sha256), tls/ (cert, key, hostname, keylog.txt)
+      # The only writable location: requests.jsonl, connections.jsonl,
+      # streams/ (framing), bodies/ (deduplicated payloads by sha256),
+      # tls/ (cert, key, hostname, keylog.txt)
       - sensor-data:/data
 
 volumes:

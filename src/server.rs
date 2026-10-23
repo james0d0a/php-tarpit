@@ -164,16 +164,28 @@ impl Drop for Sensor {
 /// Binds `addr:port`. An unspecified IPv6 address is dual-stack on Linux; if
 /// the host has no IPv6, fall back to `0.0.0.0`.
 async fn bind(addr: IpAddr, port: u16) -> Result<TcpListener> {
-    match TcpListener::bind((addr, port)).await {
-        Ok(l) => Ok(l),
-        Err(e) if addr.is_unspecified() && addr.is_ipv6() => {
+    let result = match TcpListener::bind((addr, port)).await {
+        Err(e)
+            if addr.is_unspecified()
+                && addr.is_ipv6()
+                // EAFNOSUPPORT/EADDRNOTAVAIL on hosts without IPv6; never mask
+                // errors that IPv4 would hit too.
+                && !matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AddrInUse) =>
+        {
             tracing::warn!(error = %e, port, "IPv6 bind failed; falling back to IPv4");
-            TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
-                .await
-                .with_context(|| format!("binding 0.0.0.0:{port}"))
+            TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await
         }
-        Err(e) => Err(e).with_context(|| format!("binding {addr}:{port}")),
-    }
+        other => other,
+    };
+    result.map_err(|e| {
+        let hint = if e.kind() == std::io::ErrorKind::PermissionDenied && port < 1024 {
+            " (ports below 1024 need CAP_NET_BIND_SERVICE: run as root, or grant the capability; \
+             in Docker that needs cap_add NET_BIND_SERVICE and Engine 24.0.6+)"
+        } else {
+            ""
+        };
+        anyhow::Error::new(e).context(format!("binding {addr}:{port}{hint}"))
+    })
 }
 
 async fn accept_loop(listener: TcpListener, shared: Arc<Shared>, tls: Option<TlsAcceptor>) {
