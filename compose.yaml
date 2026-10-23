@@ -1,0 +1,18 @@
+services:
+  sensor:
+    build: .
+    image: php_tarpit:latest
+    restart: unless-stopped
+    # Host networking records client source IPs and IPv6 exactly as they arrive.
+    network_mode: host
+    environment:
+      # PHP_TARPIT_PERSONA: /etc/php_tarpit/personas/apache-modphp-wordpress.toml
+      # PHP_TARPIT_HTTP_PORT: "80"
+      # PHP_TARPIT_HTTPS_PORT: "443"
+      RUST_LOG: info
+    volumes:
+      # requests.jsonl, connections.jsonl, streams/, tls/ (cert, key, keylog.txt)
+      - sensor-data:/data
+
+volumes:
+  sensor-data:
