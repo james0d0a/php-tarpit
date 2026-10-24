@@ -59,6 +59,8 @@ async fn start_with(dir: &Path, mut cli: Overrides, env: Overrides) -> Sensor {
     std::fs::write(&persona_path, PERSONA).unwrap();
     let persona = PersonaFile::load(&persona_path).unwrap();
     cli.data_dir = Some(dir.join("data"));
+    // Wire capture needs CAP_NET_RAW; it is exercised by the harness.
+    cli.pcap = Some(false);
     let settings = Settings::resolve(&cli, &env, &persona.settings).unwrap();
     Sensor::start(settings, persona).await.unwrap()
 }

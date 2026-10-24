@@ -11,6 +11,7 @@ pub mod server;
 mod session;
 pub mod storage;
 pub mod tls;
+mod wire;
 
 pub use config::{Overrides, Settings};
 pub use persona::PersonaFile;

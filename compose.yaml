@@ -1,7 +1,7 @@
 # Requires Docker Engine 24.0.6+ (moby#46221) running as root (not rootless):
-# the binary carries the file capability cap_net_bind_service=+ep, which the
-# kernel can only honour if the container is granted NET_BIND_SERVICE. Without
-# it (older engine, or cap_add removed) the container fails at start with
+# the binary carries the file capabilities cap_net_bind_service,cap_net_raw=+ep,
+# which the kernel can only honour if the container is granted both. Without
+# them (older engine, or cap_add trimmed) the container fails at start with
 # "exec ... Operation not permitted".
 services:
   sensor:
@@ -11,7 +11,8 @@ services:
     # Host networking records client source IPs and IPv6 exactly as they arrive.
     network_mode: host
     # Non-root (the image's `nonroot`, uid 65532), read-only root filesystem,
-    # no privilege escalation, and only the capability to bind ports < 1024.
+    # no privilege escalation, and only the capabilities to bind ports < 1024
+    # and to capture the sensor's own traffic.
     user: "65532:65532"
     read_only: true
     security_opt:
@@ -20,6 +21,7 @@ services:
       - ALL
     cap_add:
       - NET_BIND_SERVICE
+      - NET_RAW
     # Each setting resolves as CLI flag > PHP_TARPIT_* variable > persona
     # [settings] > built-in default. Uncomment to override the persona.
     environment:
@@ -31,11 +33,13 @@ services:
       # PHP_TARPIT_PHP_VERSION: "8.3.30"
       # PHP_TARPIT_MAX_CONNECTION_BYTES: 64MiB
       # PHP_TARPIT_MAX_TOTAL_BYTES: 5GiB
+      # PHP_TARPIT_PCAP: "true"               # rolling pcap of ports 80/443 only (no SSH)
+      # PHP_TARPIT_PCAP_FILE_BYTES: 64MiB
       RUST_LOG: info
     volumes:
       # The only writable location: requests.jsonl, connections.jsonl,
       # streams/ (framing), bodies/ (deduplicated payloads by sha256),
-      # tls/ (cert, key, hostname, keylog.txt)
+      # pcap/ (rolling wire capture), tls/ (cert, key, hostname, keylog.txt)
       - sensor-data:/data
 
 volumes:

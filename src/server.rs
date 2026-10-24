@@ -26,6 +26,7 @@ use crate::{
     session::AttackSessions,
     storage::Storage,
     tls,
+    wire::WireCapture,
 };
 
 pub const REQUESTS_LOG: &str = "requests.jsonl";
@@ -96,6 +97,7 @@ pub struct Sensor {
     pub http_addr: SocketAddr,
     pub https_addr: SocketAddr,
     tasks: Vec<JoinHandle<()>>,
+    _wire: Option<WireCapture>,
 }
 
 impl Sensor {
@@ -129,6 +131,11 @@ impl Sensor {
         let https = bind(settings.bind, settings.https_port).await?;
         let http_addr = http.local_addr()?;
         let https_addr = https.local_addr()?;
+        // Started before accepting, so the first connections are on the wire too.
+        let wire = settings
+            .pcap
+            .then(|| WireCapture::start(storage.clone(), &[http_addr.port(), https_addr.port()], settings.pcap_file_bytes))
+            .transpose()?;
         tracing::info!(
             persona = shared.persona.name,
             hostname,
@@ -149,6 +156,7 @@ impl Sensor {
                 tokio::spawn(accept_loop(https, shared, Some(acceptor))),
                 tokio::spawn(storage.rotation_task()),
             ],
+            _wire: wire,
         })
     }
 }

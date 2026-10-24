@@ -1,6 +1,6 @@
 # Black-box lab: the hardened sensor plus client containers on an internal
-# network whose only reachable host is the sensor. Driven by `cargo test -p
-# harness`; each test runs it under its own compose project name.
+# network whose only reachable host is the sensor. Driven by `cargo harness`;
+# each test runs it under its own compose project name.
 services:
   sensor:
     build: ..
@@ -13,8 +13,11 @@ services:
       - ALL
     cap_add:
       - NET_BIND_SERVICE
+      - NET_RAW
     environment:
       PHP_TARPIT_HOSTNAME: sensor
+      # Small files, so a test's traffic spans several and rotation is visible.
+      PHP_TARPIT_PCAP_FILE_BYTES: 256KiB
       RUST_LOG: info
     volumes:
       - sensor-data:/data
@@ -31,6 +34,16 @@ services:
     build: clients/nuclei
     image: php_tarpit-harness-nuclei:v3.11.1
     profiles: [clients]
+    networks:
+      - lab
+
+  # Reads the sensor's pcap and key log straight from its volume.
+  tshark:
+    build: clients/tshark
+    image: php_tarpit-harness-tshark:bookworm
+    profiles: [clients]
+    volumes:
+      - sensor-data:/data:ro
     networks:
       - lab
 

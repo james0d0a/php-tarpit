@@ -41,6 +41,14 @@ pub struct Overrides {
     /// Total disk cap for the data directory, e.g. `5GiB` [env: PHP_TARPIT_MAX_TOTAL_BYTES] [default: 5GiB]
     #[arg(long)]
     pub max_total_bytes: Option<ByteSize>,
+    /// Wire capture of the sensor ports into rolling pcap files; needs
+    /// CAP_NET_RAW [env: PHP_TARPIT_PCAP] [default: true]
+    #[arg(long)]
+    pub pcap: Option<bool>,
+    /// Size at which a pcap file is closed and the next started, e.g. `64MiB`
+    /// [env: PHP_TARPIT_PCAP_FILE_BYTES] [default: 64MiB]
+    #[arg(long)]
+    pub pcap_file_bytes: Option<ByteSize>,
 }
 
 impl Overrides {
@@ -65,6 +73,8 @@ impl Overrides {
             php_version: var(&get, "PHP_TARPIT_PHP_VERSION")?,
             max_connection_bytes: var(&get, "PHP_TARPIT_MAX_CONNECTION_BYTES")?,
             max_total_bytes: var(&get, "PHP_TARPIT_MAX_TOTAL_BYTES")?,
+            pcap: var(&get, "PHP_TARPIT_PCAP")?,
+            pcap_file_bytes: var(&get, "PHP_TARPIT_PCAP_FILE_BYTES")?,
         })
     }
 }
@@ -82,6 +92,8 @@ pub struct Settings {
     pub php_version: String,
     pub max_connection_bytes: u64,
     pub max_total_bytes: u64,
+    pub pcap: bool,
+    pub pcap_file_bytes: u64,
 }
 
 impl Settings {
@@ -103,6 +115,8 @@ impl Settings {
             php_version: pick!(php_version).unwrap_or_else(|| "8.3.30".to_owned()),
             max_connection_bytes: pick!(max_connection_bytes).map_or(64 << 20, |b| b.0),
             max_total_bytes: pick!(max_total_bytes).map_or(5 << 30, |b| b.0),
+            pcap: pick!(pcap).unwrap_or(true),
+            pcap_file_bytes: pick!(pcap_file_bytes).map_or(64 << 20, |b| b.0),
         };
         settings.validate()?;
         Ok(settings)
@@ -121,8 +135,8 @@ impl Settings {
         if self.http_port != 0 && self.http_port == self.https_port {
             bail!("http_port and https_port are both {}", self.http_port);
         }
-        if self.max_connection_bytes == 0 || self.max_total_bytes == 0 {
-            bail!("disk caps must be greater than zero");
+        if self.max_connection_bytes == 0 || self.max_total_bytes == 0 || self.pcap_file_bytes == 0 {
+            bail!("disk caps and pcap_file_bytes must be greater than zero");
         }
         Ok(())
     }

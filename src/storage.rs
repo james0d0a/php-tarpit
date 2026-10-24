@@ -1,11 +1,12 @@
 //! Data directory management: the deduplicated body store, disk usage
 //! accounting, and oldest-first rotation under the total disk cap.
 //!
-//! Rotation deletes whole connections (both stream files) by last write time
-//! and bodies by last reference time (their mtime is bumped on every dedup
-//! hit), oldest first, until usage is back under 90% of the cap. Streams of
-//! live connections and in-progress bodies are never rotated. JSONL logs and
-//! TLS material count toward the cap but are not rotated.
+//! Rotation deletes whole connections (both stream files) by last write time,
+//! bodies by last reference time (their mtime is bumped on every dedup hit)
+//! and wire-capture files by last write time, oldest first, until usage is
+//! back under 90% of the cap. Streams of live connections, in-progress bodies
+//! and the pcap file being written are never rotated. JSONL logs and TLS
+//! material count toward the cap but are not rotated.
 
 use std::{
     collections::HashSet,
@@ -28,6 +29,7 @@ use uuid::Uuid;
 
 pub const STREAMS_DIR: &str = "streams";
 pub const BODIES_DIR: &str = "bodies";
+pub const PCAP_DIR: &str = "pcap";
 /// Inside `bodies/`: bodies still being received.
 const TMP_DIR: &str = "tmp";
 /// Rescan interval, so log growth (not tracked incrementally) is noticed.
@@ -38,10 +40,12 @@ pub struct Storage {
     streams_dir: PathBuf,
     bodies_dir: PathBuf,
     tmp_dir: PathBuf,
+    pcap_dir: PathBuf,
     max_total_bytes: u64,
     used: AtomicU64,
     over_cap: Notify,
     live: Mutex<HashSet<Uuid>>,
+    live_files: Mutex<HashSet<PathBuf>>,
 }
 
 impl Storage {
@@ -49,9 +53,10 @@ impl Storage {
         let streams_dir = data_dir.join(STREAMS_DIR);
         let bodies_dir = data_dir.join(BODIES_DIR);
         let tmp_dir = bodies_dir.join(TMP_DIR);
+        let pcap_dir = data_dir.join(PCAP_DIR);
         // Bodies left in tmp by a crash are incomplete; drop them.
         let _ = std::fs::remove_dir_all(&tmp_dir);
-        for dir in [&streams_dir, &bodies_dir, &tmp_dir] {
+        for dir in [&streams_dir, &bodies_dir, &tmp_dir, &pcap_dir] {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         let storage = Arc::new(Self {
@@ -59,10 +64,12 @@ impl Storage {
             streams_dir,
             bodies_dir,
             tmp_dir,
+            pcap_dir,
             max_total_bytes,
             used: AtomicU64::new(0),
             over_cap: Notify::new(),
             live: Mutex::default(),
+            live_files: Mutex::default(),
         });
         storage.rotate_now();
         Ok(storage)
@@ -70,6 +77,10 @@ impl Storage {
 
     pub fn streams_dir(&self) -> &Path {
         &self.streams_dir
+    }
+
+    pub fn pcap_dir(&self) -> &Path {
+        &self.pcap_dir
     }
 
     pub fn body_path(&self, sha256: &[u8; 32]) -> PathBuf {
@@ -105,6 +116,16 @@ impl Storage {
         }
     }
 
+    /// Marks a file as being written, so rotation leaves it alone.
+    pub fn set_live_file(&self, path: &Path, live: bool) {
+        let mut set = self.live_files.lock().expect("live file set poisoned");
+        if live {
+            set.insert(path.to_owned());
+        } else {
+            set.remove(path);
+        }
+    }
+
     /// Runs rotation whenever usage crosses the cap, and rescans periodically.
     pub async fn rotation_task(self: Arc<Self>) {
         loop {
@@ -118,7 +139,7 @@ impl Storage {
     }
 
     /// Rescans the data directory and, if over the cap, deletes the oldest
-    /// connections and bodies. Blocking.
+    /// connections, bodies and pcap files. Blocking.
     pub fn rotate_now(&self) {
         let mut files = Vec::new();
         let total = walk(&self.data_dir, &mut files);
@@ -128,6 +149,7 @@ impl Storage {
         }
 
         let live = self.live.lock().expect("live set poisoned").clone();
+        let live_files = self.live_files.lock().expect("live file set poisoned").clone();
         // Candidates: (age, size, paths). Stream files group per connection.
         let mut candidates: Vec<(SystemTime, u64, Vec<PathBuf>)> = Vec::new();
         let mut by_conn: std::collections::HashMap<String, usize> = Default::default();
@@ -152,7 +174,9 @@ impl Storage {
                         candidates.push((f.mtime, f.size, vec![f.path]));
                     }
                 }
-            } else if parent == Some(self.bodies_dir.as_path()) {
+            } else if parent == Some(self.bodies_dir.as_path())
+                || (parent == Some(self.pcap_dir.as_path()) && !live_files.contains(&f.path))
+            {
                 candidates.push((f.mtime, f.size, vec![f.path]));
             }
         }
@@ -230,4 +254,33 @@ fn walk(dir: &Path, out: &mut Vec<FileInfo>) -> u64 {
         }
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_aged(path: &Path, secs_ago: u64) {
+        std::fs::write(path, vec![0u8; 1000]).unwrap();
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(secs_ago)).unwrap();
+    }
+
+    #[test]
+    fn pcap_rotation_is_oldest_first_but_spares_the_file_being_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path(), 2500).unwrap();
+        let pcap = storage.pcap_dir().to_owned();
+        let (writing, older, newer) = (pcap.join("a.pcap"), pcap.join("b.pcap"), pcap.join("c.pcap"));
+        file_aged(&writing, 300);
+        file_aged(&older, 200);
+        file_aged(&newer, 100);
+        storage.set_live_file(&writing, true);
+
+        storage.rotate_now();
+        assert!(writing.exists(), "the live file was rotated");
+        assert!(!older.exists(), "the oldest closed file survived");
+        assert!(newer.exists(), "rotated more than needed");
+        assert_eq!(storage.used(), 2000);
+    }
 }

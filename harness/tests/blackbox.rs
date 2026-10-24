@@ -130,3 +130,53 @@ fn official_nuclei_template_flags_the_sensor_vulnerable() {
     }
     assert!(nuclei.last().is_some_and(|r| r["method"] == "GET"), "no final version-check GET");
 }
+
+#[test]
+fn wire_capture_holds_only_sensor_traffic_rotates_and_decrypts_with_the_key_log() {
+    let lab = Lab::up();
+    // Not a sensor port: refused, and must stay out of the capture.
+    lab.client("curl", &[], &["-s", "-m", "3", "http://sensor:8080/"]);
+    // Four ~100 KB HTTP/2 POSTs: enough to roll the 256 KiB pcap files.
+    let body = "harness-pcap-".repeat(8_000);
+    let out = lab.client(
+        "curl",
+        &[],
+        &["-s", "-k", "--http2", "-o", "/dev/null", "--data-binary", &body, "https://sensor/?harness=pcap&n=[1-4]"],
+    );
+    assert_eq!(out.status, 0, "{}", out.stderr);
+
+    // One TLS session spans several files, so merge before decrypting.
+    let script = "set -e; mergecap -w /tmp/all.pcap /data/pcap/*.pcap; \
+        stat -c 'size %s' /data/pcap/*.pcap; \
+        tshark -r /tmp/all.pcap -Y 'tcp.flags.syn==1 && tcp.flags.ack==0' -T fields -e tcp.dstport | sed 's/^/syn /'; \
+        tshark -r /tmp/all.pcap -o tls.keylog_file:/data/tls/keylog.txt -Y http2.headers.path \
+            -T fields -e http2.headers.path | tr ',' '\\n' | sed 's/^/path /'";
+    // The capture thread flushes after a second without packets.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (sizes, syns) = loop {
+        let out = lab.client("tshark", &[], &[script]);
+        let field = |tag: &str| -> Vec<String> {
+            out.stdout.lines().filter_map(|l| l.strip_prefix(tag).map(str::to_owned)).collect()
+        };
+        let paths = field("path ");
+        if (1..=4).all(|n| paths.contains(&format!("/?harness=pcap&n={n}"))) {
+            break (field("size "), field("syn "));
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "decrypted pcap never showed all requests:\n{}\n{}",
+            out.stdout,
+            out.stderr
+        );
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    };
+
+    assert!(syns.iter().any(|p| p == "443"), "no connection to 443 captured: {syns:?}");
+    assert!(!syns.iter().any(|p| p == "8080"), "non-sensor port captured: {syns:?}");
+    assert!(sizes.len() >= 2, "pcap did not rotate: {sizes:?}");
+    // A file closes once it reaches the limit, so it overshoots by at most one packet.
+    let limit = 256 * 1024 + 65_536 + 16;
+    for size in &sizes {
+        assert!(size.parse::<u64>().unwrap() <= limit, "pcap file over limit: {sizes:?}");
+    }
+}
