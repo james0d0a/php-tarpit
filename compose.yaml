@@ -43,3 +43,29 @@ services:
       # (deduplicated payloads by sha256), pcap/ (rolling wire capture),
       # tls/ (cert, key, hostname, keylog.txt). Add `:Z` on SELinux hosts.
       - ./data:/data
+
+  # Read-only review UI (docs/adr/0001). Opt in with
+  # `docker compose --profile viewer up -d`, then from your workstation
+  # `ssh -L 8080:127.0.0.1:8080 <sensor-host>` and open http://localhost:8080.
+  viewer:
+    profiles: ["viewer"]
+    build:
+      context: .
+      dockerfile: viewer/Dockerfile
+    image: php_tarpit_viewer:latest
+    restart: unless-stopped
+    user: "65532:65532"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      # All interfaces inside the container's own network namespace; the
+      # only way in is the port published on the host's loopback below.
+      PHP_TARPIT_VIEWER_BIND: 0.0.0.0
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./data:/data:ro

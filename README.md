@@ -32,9 +32,23 @@ Everything is written to `./data/`, readable without root except `tls/key.pem` a
 
 To decrypt: `mergecap -w all.pcap data/pcap/*.pcap`, then open `all.pcap` with `tls.keylog_file` set to `data/tls/keylog.txt`.
 
+## Review
+
+The viewer is a read-only web UI over `./data`, browsed by attack session. It listens on the host's loopback only and has no login, so reach it through SSH:
+
+```sh
+docker compose --profile viewer up -d --build    # on the sensor host
+ssh -L 8080:127.0.0.1:8080 <sensor-host>          # on your workstation
+```
+
+Then open http://localhost:8080. Filter attack sessions by body, request count, method, status, target, source IP, time or first sighting (the session that first sent a given request body); drill into requests for headers, bodies (text or hex, download as a file) and the exact wire bytes. Refresh to pick up new traffic.
+
+To review a copy instead: `cargo run --release --manifest-path viewer/Cargo.toml -- --data-dir ./copy-of-data`, then open http://localhost:8080.
+
 ## Test
 
 ```sh
 cargo test      # unit tests (needs libpcap-devel)
 cargo harness   # end-to-end with curl and Nuclei (needs Docker)
+cargo test --manifest-path viewer/Cargo.toml    # viewer
 ```

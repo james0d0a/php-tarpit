@@ -1,0 +1,22 @@
+body { font: 14px/1.4 system-ui, sans-serif; margin: 1.5em; color: #1b1b1b; background: #fcfcfc; }
+h1 { font-size: 1.3em; word-break: break-all; }
+h2 { font-size: 1.1em; margin-top: 1.6em; }
+h3 { font-size: 1em; }
+a { color: #0b5cad; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 3px 8px; border-bottom: 1px solid #e3e3e3; vertical-align: top; }
+th { background: #f0f0f0; position: sticky; top: 0; }
+td.num, th.num { text-align: right; }
+.mono, pre { font-family: ui-monospace, monospace; font-size: 13px; }
+td.mono { word-break: break-all; }
+pre { background: #f4f4f4; padding: 8px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; max-height: 40em; }
+dl { display: grid; grid-template-columns: max-content auto; gap: 2px 12px; }
+dt { color: #555; }
+dd { margin: 0; }
+.error { color: #b00020; }
+.note { color: #555; }
+.badge { background: #2e7d32; color: #fff; border-radius: 3px; padding: 0 5px; font-size: 12px; }
+.filters { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; margin-bottom: 1em; }
+.pager { margin-top: 1em; }
+summary { cursor: pointer; color: #555; }
+.nowrap { white-space: nowrap; word-break: normal; }
