@@ -318,30 +318,59 @@ impl KeyLog for ClientKeys {
     }
 }
 
-#[tokio::test]
-async fn http2_over_tls_lengthless_body_is_logged_and_key_log_matches_client_secrets() {
-    let dir = tempfile::tempdir().unwrap();
-    let cli = Overrides { hostname: Some("sensor.test".into()), ..Default::default() };
-    let sensor = start_with(dir.path(), cli, Overrides::default()).await;
-    let data = dir.path().join("data");
-
+/// Trusts the sensor's certificate, offers `alpn` and connects as `sensor.test`.
+async fn tls_connect(
+    sensor: &Sensor,
+    data: &Path,
+    alpn: &[&[u8]],
+    keys: Arc<ClientKeys>,
+) -> tokio_rustls::client::TlsStream<TcpStream> {
     let mut roots = RootCertStore::empty();
     for cert in CertificateDer::pem_file_iter(data.join("tls/cert.pem")).unwrap() {
         roots.add(cert.unwrap()).unwrap();
     }
-    let keys = Arc::new(ClientKeys::default());
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut client = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    client.alpn_protocols = vec![b"h2".to_vec()];
-    client.key_log = keys.clone();
+    client.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    client.key_log = keys;
 
     let tcp = TcpStream::connect(sensor.https_addr).await.unwrap();
     let name = ServerName::try_from("sensor.test").unwrap();
-    let tls = TlsConnector::from(Arc::new(client)).connect(name, tcp).await.unwrap();
+    TlsConnector::from(Arc::new(client)).connect(name, tcp).await.unwrap()
+}
+
+#[tokio::test]
+async fn default_tls_negotiates_http1_even_when_client_prefers_h2() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = Overrides { hostname: Some("sensor.test".into()), ..Default::default() };
+    let sensor = start_with(dir.path(), cli, Overrides::default()).await;
+    let data = dir.path().join("data");
+
+    let mut tls = tls_connect(&sensor, &data, &[b"h2", b"http/1.1"], Arc::default()).await;
+    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: sensor.test\r\nConnection: close\r\n\r\n").await.unwrap();
+    let mut response = Vec::new();
+    // The sensor closes without close_notify, as Apache does on Connection: close.
+    let _ = tls.read_to_end(&mut response).await;
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"), "{}", String::from_utf8_lossy(&response));
+
+    let conn = &lines(&data.join("connections.jsonl"), 1).await[0];
+    assert_eq!(conn["alpn"], "http/1.1");
+}
+
+#[tokio::test]
+async fn http2_over_tls_lengthless_body_is_logged_and_key_log_matches_client_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = Overrides { hostname: Some("sensor.test".into()), http2: Some(true), ..Default::default() };
+    let sensor = start_with(dir.path(), cli, Overrides::default()).await;
+    let data = dir.path().join("data");
+
+    let keys = Arc::new(ClientKeys::default());
+    let tls = tls_connect(&sensor, &data, &[b"h2"], keys.clone()).await;
     assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
 
     let (h2, conn) = h2::client::handshake(tls).await.unwrap();

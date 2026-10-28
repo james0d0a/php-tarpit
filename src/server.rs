@@ -106,7 +106,7 @@ impl Sensor {
         let tls_dir = settings.data_dir.join(TLS_DIR);
         std::fs::create_dir_all(&tls_dir).with_context(|| format!("creating {}", tls_dir.display()))?;
         let storage = Storage::open(&settings.data_dir, settings.max_total_bytes)?;
-        let (tls_config, hostname) = tls::server_config(&tls_dir, settings.hostname.as_deref())?;
+        let (tls_config, hostname) = tls::server_config(&tls_dir, settings.hostname.as_deref(), settings.http2)?;
         let acceptor = TlsAcceptor::from(Arc::new(tls_config));
         let persona = Persona::build(
             persona,
@@ -144,6 +144,7 @@ impl Sensor {
             data_dir = %settings.data_dir.display(),
             max_connection_bytes = settings.max_connection_bytes,
             max_total_bytes = settings.max_total_bytes,
+            http2 = settings.http2,
             %http_addr,
             %https_addr,
             "sensor listening"

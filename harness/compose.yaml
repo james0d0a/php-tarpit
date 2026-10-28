@@ -18,6 +18,8 @@ services:
       PHP_TARPIT_HOSTNAME: sensor
       # Small files, so a test's traffic spans several and rotation is visible.
       PHP_TARPIT_PCAP_FILE_BYTES: 256KiB
+      # Off in the default config; on here so the HTTP/2 capture path is covered.
+      PHP_TARPIT_HTTP2: "true"
       RUST_LOG: info
     volumes:
       - sensor-data:/data

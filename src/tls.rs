@@ -1,6 +1,6 @@
 //! TLS: a self-signed certificate generated once per sensor and kept on the
-//! data volume, ALPN h2 + http/1.1, and an NSS key log so wire captures can
-//! be decrypted.
+//! data volume, ALPN http/1.1 (plus h2 when enabled), and an NSS key log so
+//! wire captures can be decrypted.
 //!
 //! The certificate mirrors Debian's `ssl-cert-snakeoil.pem` as produced by
 //! `make-ssl-cert` (ssl-cert 1.1.2 / OpenSSL 3.0 on bookworm): RSA 2048,
@@ -35,9 +35,9 @@ const OID_BASIC_CONSTRAINTS: &[u64] = &[2, 5, 29, 19];
 const OID_SUBJECT_ALT_NAME: &[u64] = &[2, 5, 29, 17];
 const OID_SUBJECT_KEY_IDENTIFIER: &[u64] = &[2, 5, 29, 14];
 
-/// Builds the TLS config. Returns it with the sensor's hostname, which is the
-/// certificate's CN.
-pub fn server_config(tls_dir: &Path, hostname: Option<&str>) -> Result<(ServerConfig, String)> {
+/// Builds the TLS config, offering h2 before http/1.1 when `http2` is set.
+/// Returns it with the sensor's hostname, which is the certificate's CN.
+pub fn server_config(tls_dir: &Path, hostname: Option<&str>, http2: bool) -> Result<(ServerConfig, String)> {
     let (certs, key, hostname) = load_or_create_cert(tls_dir, hostname)?;
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut config = ServerConfig::builder_with_provider(provider)
@@ -45,7 +45,11 @@ pub fn server_config(tls_dir: &Path, hostname: Option<&str>) -> Result<(ServerCo
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("loading certificate")?;
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.alpn_protocols = if http2 {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    } else {
+        vec![b"http/1.1".to_vec()]
+    };
     config.key_log = Arc::new(KeyLogFile::open(&tls_dir.join(KEYLOG_FILE))?);
     Ok((config, hostname))
 }

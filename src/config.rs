@@ -49,6 +49,11 @@ pub struct Overrides {
     /// [env: PHP_TARPIT_PCAP_FILE_BYTES] [default: 64MiB]
     #[arg(long)]
     pub pcap_file_bytes: Option<ByteSize>,
+    /// Offer HTTP/2 via ALPN on the TLS port. Off by default: Debian's Apache
+    /// with mod_php runs the prefork MPM, under which mod_http2 does not
+    /// serve, so it answers HTTP/1.1 only [env: PHP_TARPIT_HTTP2] [default: false]
+    #[arg(long)]
+    pub http2: Option<bool>,
 }
 
 impl Overrides {
@@ -75,6 +80,7 @@ impl Overrides {
             max_total_bytes: var(&get, "PHP_TARPIT_MAX_TOTAL_BYTES")?,
             pcap: var(&get, "PHP_TARPIT_PCAP")?,
             pcap_file_bytes: var(&get, "PHP_TARPIT_PCAP_FILE_BYTES")?,
+            http2: var(&get, "PHP_TARPIT_HTTP2")?,
         })
     }
 }
@@ -94,6 +100,7 @@ pub struct Settings {
     pub max_total_bytes: u64,
     pub pcap: bool,
     pub pcap_file_bytes: u64,
+    pub http2: bool,
 }
 
 impl Settings {
@@ -117,6 +124,7 @@ impl Settings {
             max_total_bytes: pick!(max_total_bytes).map_or(5 << 30, |b| b.0),
             pcap: pick!(pcap).unwrap_or(true),
             pcap_file_bytes: pick!(pcap_file_bytes).map_or(64 << 20, |b| b.0),
+            http2: pick!(http2).unwrap_or(false),
         };
         settings.validate()?;
         Ok(settings)
